@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+models/*.pt
+!models/action_demo.pt
+reports/*
+!reports/.gitkeep
+data/frames/
+data/action_clips/
+data/action_real.npz
+data/pose_real.npz
+videos/

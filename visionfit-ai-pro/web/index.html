@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VisionFit AI Studio — Test & Train Gym AI</title>
+  <meta name="description" content="Nền tảng kiểm thử và huấn luyện AI đếm rep động tác gym với MediaPipe Pose và TensorFlow.js">
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- CSS -->
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- MediaPipe Pose, Hands & Camera Utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  
+  <!-- TensorFlow.js for In-Browser Training -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  
+  <!-- Chart.js for Training Graphs -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div class="brand-title">VisionFit AI Studio</div>
+      </div>
+      <span class="brand-badge">Pro v2.0</span>
+    </div>
+
+    <div class="header-status">
+      <div class="status-badge" id="poseStatusBadge">
+        <span class="status-dot amber" id="poseDot"></span>
+        <span id="poseStatusText">Pose Engine: Khởi tạo...</span>
+      </div>
+      <div class="status-badge" id="aiStatusBadge">
+        <span class="status-dot" id="aiDot"></span>
+        <span id="aiStatusText">AI Model: Rule-based + Hysteresis</span>
+      </div>
+      <div class="status-badge" id="serverStatusBadge">
+        <span class="status-dot amber" id="serverDot"></span>
+        <span id="serverStatusText">Backend: Standalone</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="nav-tabs">
+    <button class="tab-btn active" data-tab="liveTab" id="tabBtnLive">
+      <span>🏋️</span> Kiểm thử & Tập luyện (Live Test)
+    </button>
+    <button class="tab-btn" data-tab="collectTab" id="tabBtnCollect">
+      <span>📹</span> Thu thập & Gán nhãn (Data Lab)
+    </button>
+    <button class="tab-btn" data-tab="trainTab" id="tabBtnTrain">
+      <span>🧠</span> Huấn luyện AI (Train Model)
+    </button>
+    <button class="tab-btn" data-tab="simTab" id="tabBtnSim">
+      <span>⚡</span> Bộ Giả Lập Cử Động (Simulator)
+    </button>
+    <button class="tab-btn" data-tab="bridgeTab" id="tabBtnBridge">
+      <span>🔌</span> Python Bridge & PyTorch
+    </button>
+  </nav>
+
+  <!-- Main Content -->
+  <main class="app-main">
+
+    <!-- ================= TAB 1: LIVE TEST & WORKOUT ================= -->
+    <section class="tab-pane active" id="liveTab">
+      <div class="grid-2col">
+        <!-- Left: Camera Viewport & HUD -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">📷</span> Trực tiếp nhận diện & Phân tích Form
+            </h2>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span class="badge-tag green" id="fpsBadge">0 FPS</span>
+              <span class="badge-tag cyan" id="sourceBadge">WEBCAM</span>
+            </div>
+          </div>
+
+          <!-- Video & Canvas Viewport -->
+          <div class="viewport-container" id="viewportBox">
+            <div class="viewport-screen mirrored" id="viewportScreen">
+              <video class="viewport-video" id="videoElement" playsinline></video>
+              <canvas class="viewport-canvas" id="canvasElement"></canvas>
+            </div>
+
+            <!-- HUD Overlay (đặt bên ngoài viewport-screen để chữ không bị ngược) -->
+            <div class="hud-overlay">
+              <div class="hud-top">
+                <div class="hud-action-tag">
+                  <span class="hud-action-name" id="hudActionName">STANDBY</span>
+                  <span class="hud-action-conf" id="hudActionConf">Độ tin cậy: --%</span>
+                </div>
+                <div class="hud-rep-counter">
+                  <div class="hud-rep-number" id="hudRepCount">0</div>
+                  <div class="hud-rep-label">REPETITIONS</div>
+                </div>
+              </div>
+
+              <div class="hud-bottom">
+                <div class="hud-phase-pill" id="hudPhasePill">PHASE: READY</div>
+                <div class="hud-angle-pill" id="hudAnglePill">Góc khớp: --°</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Controls under Viewport -->
+          <div class="controls-bar">
+            <button class="btn btn-primary" id="btnToggleCam">
+              <span>▶</span> Bật Webcam
+            </button>
+            <button class="btn btn-cyan" id="btnToggleSimMode">
+              <span>⚡</span> Chạy Giả Lập (Không cần Cam)
+            </button>
+            <button class="btn btn-outline" id="btnToggleMirror">
+              <span id="mirrorIcon">🔄</span> <span id="mirrorText">Lật gương: BẬT</span>
+            </button>
+            <button class="btn btn-outline" id="btnResetReps">
+              <span>🔄</span> Reset Reps
+            </button>
+            <button class="btn btn-outline" id="btnToggleAudio">
+              <span id="audioIcon">🔊</span> Âm thanh: BẬT
+            </button>
+            <label class="btn btn-outline" style="cursor: pointer;">
+              <span>📁</span> Tải Video lên
+              <input type="file" id="videoFileInput" accept="video/*" style="display: none;">
+            </label>
+          </div>
+        </div>
+
+        <!-- Right: Stats, Probabilities & Feedback -->
+        <div style="display: flex; flex-direction: column; gap: 20px;">
+          <!-- HUD Stats Grid -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <span class="stat-label">Số Rep hoàn thành</span>
+              <span class="stat-value" id="statReps">0</span>
+              <span class="stat-sub" id="statRepsSub">Mục tiêu: 15 reps</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Thời gian tập</span>
+              <span class="stat-value" id="statTime">00:00</span>
+              <span class="stat-sub">Thời gian thực</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Calo ước tính</span>
+              <span class="stat-value" id="statCalories">0.0</span>
+              <span class="stat-sub">kcal đốt cháy</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-label">Độ chuẩn Form</span>
+              <span class="stat-value" id="statFormScore">--%</span>
+              <span class="stat-sub" id="statFormEval">Sẵn sàng</span>
+            </div>
+          </div>
+
+          <!-- Real-time Class Probabilities -->
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">
+                <span class="card-title-icon">📊</span> Xác suất phân loại động tác
+              </h3>
+              <select class="form-select" id="modelSelect" style="width: auto; padding: 4px 10px; font-size: 0.8rem;">
+                <option value="rules">1. Rule-based Biomechanics (Góc khớp + Ngưỡng)</option>
+                <option value="tfjs" id="optTfjs" disabled>2. TensorFlow.js Model (Chưa train)</option>
+              </select>
+            </div>
+
+            <div class="prob-list">
+              <div class="prob-item" id="probItemSquat">
+                <div class="prob-header">
+                  <span>🦵 Squat (Gánh đùi)</span>
+                  <span id="probValSquat">0%</span>
+                </div>
+                <div class="prob-track">
+                  <div class="prob-bar" id="probBarSquat" style="width: 0%;"></div>
+                </div>
+              </div>
+
+              <div class="prob-item" id="probItemPushup">
+                <div class="prob-header">
+                  <span>💪 Push-up (Hít đất)</span>
+                  <span id="probValPushup">0%</span>
+                </div>
+                <div class="prob-track">
+                  <div class="prob-bar" id="probBarPushup" style="width: 0%;"></div>
+                </div>
+              </div>
+
+              <div class="prob-item" id="probItemLunge">
+                <div class="prob-header">
+                  <span>🚶 Lunge (Chùng chân)</span>
+                  <span id="probValLunge">0%</span>
+                </div>
+                <div class="prob-track">
+                  <div class="prob-bar" id="probBarLunge" style="width: 0%;"></div>
+                </div>
+              </div>
+
+              <div class="prob-item" id="probItemStanding">
+                <div class="prob-header">
+                  <span>🧍 Standing (Đứng thẳng / Nghỉ)</span>
+                  <span id="probValStanding">0%</span>
+                </div>
+                <div class="prob-track">
+                  <div class="prob-bar" id="probBarStanding" style="width: 0%;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Form Evaluation Guide -->
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">
+                <span class="card-title-icon">🎯</span> Hướng dẫn Kỹ thuật & Góc Khớp
+              </h3>
+            </div>
+            <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 8px;">
+              <div>• <b>Squat:</b> Xuống tới khi góc gối ≤ <b>100°</b>, đứng thẳng góc gối ≥ <b>160°</b> để hoàn tất 1 rep.</div>
+              <div>• <b>Push-up:</b> Hạ người tới khi khuỷu tay ≤ <b>95°</b>, đẩy thẳng tay ≥ <b>155°</b>.</div>
+              <div>• <b>Lunge:</b> Gối chân trước hạ xuống ≤ <b>100°</b> và duỗi thẳng ≥ <b>155°</b>.</div>
+              <div id="liveFeedbackNotice" style="color: var(--accent-green); font-weight: 600; margin-top: 4px;">
+                💡 Hãy đứng trọn vẹn trong khung hình để hệ thống phát hiện đủ 33 khớp.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TAB 2: DATA COLLECTION & LABELS ================= -->
+    <section class="tab-pane" id="collectTab">
+      <div class="grid-2col">
+        <!-- Left: Recording Controls -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">📹</span> Thu Thập Dữ Liệu Khớp (Landmarks Collector)
+            </h2>
+            <div class="recording-indicator" id="recIndicator">
+              <span class="recording-dot"></span> Đang ghi dữ liệu
+            </div>
+          </div>
+
+          <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px;">
+            Ghi lại chuỗi 32 frames cử động thực tế (chuẩn định dạng chuỗi của VisionFit Temporal CNN). Bạn có thể thu từ camera hoặc dùng video.
+          </p>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+            <div class="form-group">
+              <label class="form-label" for="collectLabelSelect">Gán nhãn Động tác (Action Label)</label>
+              <select class="form-select" id="collectLabelSelect">
+                <option value="squat">squat (Gánh đùi)</option>
+                <option value="push_up">push_up (Hít đất)</option>
+                <option value="lunge">lunge (Chùng chân)</option>
+                <option value="standing">standing (Đứng thẳng / Nghỉ)</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="collectSubjectInput">Subject ID (Mã người tập)</label>
+              <input type="text" class="form-control" id="collectSubjectInput" value="person01" placeholder="person01, person02...">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Chế độ thu mẫu:</label>
+            <div style="display: flex; gap: 12px;">
+              <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                <input type="radio" name="recMode" value="clip32" checked> Clip chuẩn 32 Frames (Khuyên dùng)
+              </label>
+              <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                <input type="radio" name="recMode" value="stream"> Dòng liên tục (Continuous)
+              </label>
+            </div>
+          </div>
+
+          <div class="controls-bar" style="margin-top: 20px;">
+            <button class="btn btn-primary" id="btnStartRecord">
+              <span>🔴</span> Bắt đầu ghi mẫu (Đếm ngược 3s)
+            </button>
+            <button class="btn btn-danger" id="btnStopRecord" disabled>
+              <span>⏹</span> Dừng ghi
+            </button>
+          </div>
+
+          <div class="progress-container" id="recProgressBox" style="display: none; margin-top: 18px;">
+            <div class="progress-fill" id="recProgressBar"></div>
+          </div>
+          <div id="recStatusMsg" style="font-size: 0.85rem; color: var(--text-muted); margin-top: 6px;"></div>
+        </div>
+
+        <!-- Right: Dataset Management & Export -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">📁</span> Bộ Dữ Liệu Hiện Tại (Dataset Manager)
+            </h2>
+            <span class="badge-tag cyan" id="totalSamplesBadge">0 Mẫu</span>
+          </div>
+
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;" id="classBadgesContainer">
+            <span class="badge-tag green">squat: 0</span>
+            <span class="badge-tag green">push_up: 0</span>
+            <span class="badge-tag green">lunge: 0</span>
+            <span class="badge-tag green">standing: 0</span>
+          </div>
+
+          <div style="max-height: 280px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: var(--radius-sm);">
+            <table class="dataset-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Nhãn</th>
+                  <th>Người tập</th>
+                  <th>Số Frames</th>
+                  <th>Thời điểm</th>
+                  <th>Thao tác</th>
+                </tr>
+              </thead>
+              <tbody id="datasetTableBody">
+                <tr>
+                  <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 24px;">
+                    Chưa có mẫu nào được ghi. Hãy bấm ghi hoặc nạp bộ mẫu thử!
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Dataset Operations -->
+          <div class="controls-bar" style="margin-top: 18px;">
+            <button class="btn btn-cyan" id="btnExportJson">
+              <span>💾</span> Xuất Dataset (.JSON)
+            </button>
+            <label class="btn btn-outline" style="cursor: pointer;">
+              <span>📥</span> Nhập Dataset (.JSON)
+              <input type="file" id="importJsonInput" accept=".json" style="display: none;">
+            </label>
+            <button class="btn btn-purple" id="btnSaveToBackend">
+              <span>☁️</span> Chuyển sang Python .NPZ
+            </button>
+            <button class="btn btn-danger" id="btnClearDataset">
+              <span>🗑</span> Xóa hết
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TAB 3: IN-BROWSER AI TRAINING ================= -->
+    <section class="tab-pane" id="trainTab">
+      <div class="grid-2col">
+        <!-- Left: Training Setup -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">⚙️</span> Cấu Hình Huấn Luyện (TensorFlow.js)
+            </h2>
+            <span class="badge-tag purple">In-Browser Neural Net</span>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+            <div class="form-group">
+              <label class="form-label" for="trainEpochs">Số Epochs</label>
+              <input type="number" class="form-control" id="trainEpochs" value="30" min="5" max="200">
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="trainBatchSize">Batch Size</label>
+              <select class="form-select" id="trainBatchSize">
+                <option value="8">8</option>
+                <option value="16" selected>16</option>
+                <option value="32">32</option>
+              </select>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+            <div class="form-group">
+              <label class="form-label" for="trainLr">Learning Rate</label>
+              <select class="form-select" id="trainLr">
+                <option value="0.01">0.01 (Nhanh)</option>
+                <option value="0.005" selected>0.005 (Cân bằng)</option>
+                <option value="0.001">0.001 (Ổn định)</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="trainValSplit">Tỷ lệ Validation Split</label>
+              <select class="form-select" id="trainValSplit">
+                <option value="0.2" selected>20% (Validation)</option>
+                <option value="0.25">25% (Validation)</option>
+                <option value="0.15">15% (Validation)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Kiến trúc Mạng:</label>
+            <div style="font-size: 0.85rem; color: var(--text-muted); background: var(--bg-secondary); padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+              Input (132 features: 33 joints × 4 x/y/z/v hip-normalized) → Dense 128 (ReLU) → Dropout(0.25) → Dense 64 (ReLU) → Dense 4 (Softmax)
+            </div>
+          </div>
+
+          <div class="controls-bar" style="margin-top: 18px;">
+            <button class="btn btn-primary" id="btnStartTraining">
+              <span>🚀</span> Bắt đầu Huấn luyện AI
+            </button>
+            <button class="btn btn-cyan" id="btnLoadDemoDataset">
+              <span>📦</span> Tải Bộ Mẫu Giả Lập Chuẩn (128 mẫu)
+            </button>
+          </div>
+
+          <div class="progress-container" id="trainProgressBox" style="display: none; margin-top: 16px;">
+            <div class="progress-fill" id="trainProgressBar"></div>
+          </div>
+          <div id="trainEpochMsg" style="font-size: 0.85rem; color: var(--accent-green); margin-top: 6px; font-family: var(--font-mono);"></div>
+
+          <div style="margin-top: 16px;">
+            <label class="form-label">Terminal Huấn Luyện:</label>
+            <div class="terminal-box" id="trainLogBox">Sẵn sàng huấn luyện. Chọn số epochs và nhấn 'Bắt đầu Huấn luyện AI'...</div>
+          </div>
+        </div>
+
+        <!-- Right: Training Charts & Export -->
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">📈</span> Biểu Đồ Thời Gian Thực (Loss & Accuracy)
+            </h2>
+            <span class="badge-tag green" id="trainStatusBadge">Chờ huấn luyện</span>
+          </div>
+
+          <div class="chart-box">
+            <canvas id="lossChartCanvas"></canvas>
+          </div>
+
+          <div class="chart-box" style="margin-top: 16px;">
+            <canvas id="accChartCanvas"></canvas>
+          </div>
+
+          <div class="controls-bar" style="margin-top: 20px;">
+            <button class="btn btn-primary" id="btnApplyModelToLive" disabled>
+              <span>✅</span> Nạp Model Vào Kiểm Thử (Live Test)
+            </button>
+            <button class="btn btn-outline" id="btnDownloadModel" disabled>
+              <span>💾</span> Tải Model (.json + weights)
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TAB 4: DEMO SIMULATOR ================= -->
+    <section class="tab-pane" id="simTab">
+      <div class="grid-2col">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">⚡</span> Bộ Mô Phỏng Biomechanics 33 Khớp
+            </h2>
+            <span class="badge-tag cyan">Offline Synthetic Engine</span>
+          </div>
+
+          <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px;">
+            Mô phỏng chuỗi tọa độ 33 điểm dựa trên phương trình hình học và nhịp sinh học (chuẩn hàm <code>demo()</code> trong <code>visionfit.py</code>). Giúp bạn test nhanh quy trình thu thập dữ liệu, huấn luyện mạng AI và đếm rep mà không cần đứng trước camera.
+          </p>
+
+          <div class="form-group">
+            <label class="form-label" for="simExerciseSelect">Chọn Động tác Mô phỏng Trực Quan:</label>
+            <select class="form-select" id="simExerciseSelect">
+              <option value="squat">Squat (Gập gối lên xuống)</option>
+              <option value="push_up">Push-up (Hạ khuỷu tay)</option>
+              <option value="lunge">Lunge (Chùng chân)</option>
+              <option value="standing">Standing (Đứng yên có dao động)</option>
+            </select>
+          </div>
+
+          <div class="controls-bar">
+            <button class="btn btn-cyan" id="btnRunSimDemo">
+              <span>▶</span> Bật Hoạt Họa Mô Phỏng Ngay
+            </button>
+            <button class="btn btn-purple" id="btnGenDatasetBtn">
+              <span>⚡</span> Tự động tạo 100 mẫu Synthetic và nạp vào Dataset
+            </button>
+          </div>
+
+          <div style="margin-top: 20px; font-size: 0.85rem; color: var(--text-muted); line-height: 1.6;">
+            <b>Thông tin kỹ thuật mô phỏng:</b>
+            <ul style="padding-left: 20px; margin-top: 6px;">
+              <li>33 landmarks theo chuẩn MediaPipe pose topology.</li>
+              <li>Hông (23, 24), Vai (11, 12), Gối (25, 26), Cổ chân (27, 28), Khuỷu tay (13, 14), Cổ tay (15, 16).</li>
+              <li>Dao động sin(t) và cos(t) theo từng chu kỳ động tác cùng nhiễu Gaussian ngẫu nhiên.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">
+              <span class="card-title-icon">👁️</span> Khung Xem Mô Phỏng (Simulator Visualizer)
+            </h2>
+          </div>
+          <div class="viewport-container" style="aspect-ratio: 16/10;">
+            <canvas id="simCanvas" style="width: 100%; height: 100%;"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TAB 5: PYTHON BACKEND BRIDGE ================= -->
+    <section class="tab-pane" id="bridgeTab">
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">
+            <span class="card-title-icon">🔌</span> Kết Nối Với Hệ Thống PyTorch VisionFit AI Pro
+          </h2>
+          <span class="badge-tag green" id="backendBadge">Kiểm tra kết nối...</span>
+        </div>
+
+        <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 20px;">
+          Bạn có thể chạy song song giao diện Web này với server Python <code>web_server.py</code> để tận dụng toàn bộ pipeline PyTorch của dự án:
+        </p>
+
+        <div class="grid-3col">
+          <div class="stat-card">
+            <span class="stat-label">Model PyTorch Mặc định</span>
+            <span class="stat-value" style="font-size: 1.2rem;" id="ptActionDemo">models/action_demo.pt</span>
+            <span class="stat-sub">Mô hình Demo Temporal CNN</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Dataset Huấn Luyện</span>
+            <span class="stat-value" style="font-size: 1.2rem;">data/action_real.npz</span>
+            <span class="stat-sub">Định dạng X, y, subjects</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Số Lớp Động Tác</span>
+            <span class="stat-value" style="font-size: 1.2rem;">4 Classes</span>
+            <span class="stat-sub">squat, push_up, lunge, standing</span>
+          </div>
+        </div>
+
+        <div style="margin-top: 24px;">
+          <h3 style="font-size: 1.1rem; margin-bottom: 10px;">Lệnh dòng lệnh tiện ích (Chạy trong Terminal):</h3>
+          <div class="terminal-box" style="height: auto; padding: 16px;">
+# 1. Khởi động server Web giao diện VisionFit:
+python web_server.py --port 8000
+
+# 2. Hoặc nhấp đúp file tiện ích trên Windows:
+run_web.bat
+
+# 3. Huấn luyện lại mô hình PyTorch ActionNet:
+python visionfit.py train --data data/demo.npz --labels labels.json --out models/action_demo_new.pt --epochs 15
+
+# 4. Chạy webcam nhận diện trực tiếp bằng PyTorch OpenCV:
+python live.py --source 0 --pose-model models/pose.pt --action-model models/action_demo.pt
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- App Footer -->
+  <footer class="app-footer">
+    VisionFit AI Pro Studio &copy; 2026 — Xây dựng cho nghiên cứu và kiểm thử động tác gym offline.
+  </footer>
+
+  <!-- App Main JavaScript Logic -->
+  <script src="app.js"></script>
+</body>
+</html>

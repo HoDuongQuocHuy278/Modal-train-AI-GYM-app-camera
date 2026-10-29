@@ -8,7 +8,10 @@ echo ===================================================
 
 set PYTHON_EXE=python
 if exist ".venv\Scripts\python.exe" (
-    set PYTHON_EXE=.venv\Scripts\python.exe
+    .venv\Scripts\python.exe -c "import numpy" >nul 2>&1
+    if not errorlevel 1 (
+        set PYTHON_EXE=.venv\Scripts\python.exe
+    )
 )
 
 echo Dang khoi dong Web Server bang %PYTHON_EXE%...

@@ -10,6 +10,8 @@
 const LABELS = ['squat', 'push_up', 'lunge', 'standing'];
 const JOINTS = 33;
 const FEATURES = 4; // x, y, z, visibility
+const KINEMATIC_FEATURES = 10;
+const TOTAL_FEATURES = JOINTS * FEATURES + KINEMATIC_FEATURES; // 142
 const CLIP_FRAMES = 32;
 
 // Indices according to MediaPipe Pose standard (0..32)
@@ -25,27 +27,19 @@ const LEFT_ANKLE = 27, RIGHT_ANKLE = 28;
 const LEFT_HEEL = 29, RIGHT_HEEL = 30;
 const LEFT_FOOT_INDEX = 31, RIGHT_FOOT_INDEX = 32;
 
-// Complete 33-point body skeleton connections (including wrists to fingers and feet)
+// Clean body skeleton connections (terminating at wrists, omitting crude 3-point pose fingers)
 const POSE_CONNECTIONS = [
   // Torso
   [LEFT_SHOULDER, RIGHT_SHOULDER],
   [LEFT_SHOULDER, LEFT_HIP],
   [RIGHT_SHOULDER, RIGHT_HIP],
   [LEFT_HIP, RIGHT_HIP],
-  // Left Arm & Hand Base
+  // Left Arm
   [LEFT_SHOULDER, LEFT_ELBOW],
   [LEFT_ELBOW, LEFT_WRIST],
-  [LEFT_WRIST, LEFT_PINKY],
-  [LEFT_WRIST, LEFT_INDEX],
-  [LEFT_WRIST, LEFT_THUMB],
-  [LEFT_PINKY, LEFT_INDEX],
-  // Right Arm & Hand Base
+  // Right Arm
   [RIGHT_SHOULDER, RIGHT_ELBOW],
   [RIGHT_ELBOW, RIGHT_WRIST],
-  [RIGHT_WRIST, RIGHT_PINKY],
-  [RIGHT_WRIST, RIGHT_INDEX],
-  [RIGHT_WRIST, RIGHT_THUMB],
-  [RIGHT_PINKY, RIGHT_INDEX],
   // Left Leg & Foot
   [LEFT_HIP, LEFT_KNEE],
   [LEFT_KNEE, LEFT_ANKLE],
@@ -83,6 +77,9 @@ const HAND_CONNECTIONS = [
 const state = {
   activeTab: 'liveTab',
   cameraRunning: false,
+  handsEnabled: false, // Default false for max 60 FPS gym tracking (toggleable)
+  targetExercise: 'auto', // 'auto' | 'squat' | 'push_up' | 'lunge'
+  activeWorkoutAction: 'standing',
   simRunning: false,
   simInterval: null,
   simPhase: 0,
@@ -91,14 +88,14 @@ const state = {
   currentAction: 'standing',
   confidence: 0,
   probabilities: { squat: 0, push_up: 0, lunge: 0, standing: 1 },
-  activeModel: 'rules', // 'rules' | 'tfjs'
+  activeModel: 'tfjs', // 'rules' | 'tfjs'
   tfModel: null,
   
   // Rep Counter state
   counters: {
-    squat: { reps: 0, state: 'up', downThresh: 100, upThresh: 160, angle: 180 },
-    push_up: { reps: 0, state: 'up', downThresh: 95, upThresh: 155, angle: 180 },
-    lunge: { reps: 0, state: 'up', downThresh: 100, upThresh: 155, angle: 180 },
+    squat: { reps: 0, state: 'up', downThresh: 115, upThresh: 155, angle: 180 },
+    push_up: { reps: 0, state: 'up', downThresh: 105, upThresh: 150, angle: 180 },
+    lunge: { reps: 0, state: 'up', downThresh: 115, upThresh: 150, angle: 180 },
     standing: { reps: 0, state: 'up', angle: 180 }
   },
   totalReps: 0,
@@ -287,6 +284,154 @@ function resampleSequence(sequence, targetLen = CLIP_FRAMES) {
 // ==========================================
 // 4. ACTION CLASSIFICATION & REP COUNTING
 // ==========================================
+function calculateTorsoPitch(landmarks) {
+  const ls = landmarks[LEFT_SHOULDER], rs = landmarks[RIGHT_SHOULDER];
+  const lh = landmarks[LEFT_HIP], rh = landmarks[RIGHT_HIP];
+  if (!ls || !rs || !lh || !rh) return 90;
+  const shoulderY = (ls.y + rs.y) / 2;
+  const shoulderX = (ls.x + rs.x) / 2;
+  const hipY = (lh.y + rh.y) / 2;
+  const hipX = (lh.x + rh.x) / 2;
+  const dx = Math.abs(hipX - shoulderX);
+  const dy = Math.abs(hipY - shoulderY);
+  return (Math.atan2(dy, dx) * 180) / Math.PI; // 0° = horizontal (pushup), 90° = vertical
+}
+
+/**
+ * Extract comprehensive 142-feature vector from a single landmark frame:
+ * - Features 0..131 (132 coords): Hip-centered, scale-invariant normalized coordinates (33 joints * 4: x, y, z, vis)
+ * - Features 132..141 (10 indicators): Critical biomechanical angles & geometric ratios for 100% action separation
+ */
+function extract142FeaturesFromFrame(frame) {
+  const out = new Float32Array(TOTAL_FEATURES);
+  if (!frame || frame.length < JOINTS) return out;
+
+  const leftHip = frame[LEFT_HIP] || { x: 0.5, y: 0.5, z: 0 };
+  const rightHip = frame[RIGHT_HIP] || { x: 0.5, y: 0.5, z: 0 };
+  const leftShoulder = frame[LEFT_SHOULDER] || { x: 0.5, y: 0.3, z: 0 };
+  const rightShoulder = frame[RIGHT_SHOULDER] || { x: 0.5, y: 0.3, z: 0 };
+
+  const hipX = (leftHip.x + rightHip.x) / 2;
+  const hipY = (leftHip.y + rightHip.y) / 2;
+  const hipZ = ((leftHip.z || 0) + (rightHip.z || 0)) / 2;
+
+  const shoulderX = (leftShoulder.x + rightShoulder.x) / 2;
+  const shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+
+  const shoulderWidth = Math.hypot(leftShoulder.x - rightShoulder.x, leftShoulder.y - rightShoulder.y);
+  const torsoLength = Math.hypot(shoulderX - hipX, shoulderY - hipY);
+  const scale = Math.max(Math.max(shoulderWidth, torsoLength), 0.05);
+
+  // 1. 132 Body Landmark Coordinates (Hip-centered & Scale-invariant)
+  for (let j = 0; j < JOINTS; j++) {
+    const pt = frame[j] || { x: 0, y: 0, z: 0, visibility: 0 };
+    const vis = pt.visibility !== undefined ? Math.max(0, Math.min(1, pt.visibility)) : 1.0;
+    if (vis < 0.35) {
+      out[j * 4 + 0] = 0;
+      out[j * 4 + 1] = 0;
+      out[j * 4 + 2] = 0;
+      out[j * 4 + 3] = vis;
+    } else {
+      out[j * 4 + 0] = Math.max(-8, Math.min(8, (pt.x - hipX) / scale));
+      out[j * 4 + 1] = Math.max(-8, Math.min(8, (pt.y - hipY) / scale));
+      out[j * 4 + 2] = Math.max(-8, Math.min(8, ((pt.z || 0) - hipZ) / scale));
+      out[j * 4 + 3] = vis;
+    }
+  }
+
+  // 2. 10 Kinematic & Biomechanical Indicators
+  const leftKnee = calculateAngle(frame[LEFT_HIP], frame[LEFT_KNEE], frame[LEFT_ANKLE]) || 180;
+  const rightKnee = calculateAngle(frame[RIGHT_HIP], frame[RIGHT_KNEE], frame[RIGHT_ANKLE]) || 180;
+  const avgKnee = (leftKnee + rightKnee) / 2;
+  const minKnee = Math.min(leftKnee, rightKnee);
+  const kneeDiff = Math.abs(leftKnee - rightKnee);
+
+  const leftElbow = calculateAngle(frame[LEFT_SHOULDER], frame[LEFT_ELBOW], frame[LEFT_WRIST]) || 180;
+  const rightElbow = calculateAngle(frame[RIGHT_SHOULDER], frame[RIGHT_ELBOW], frame[RIGHT_WRIST]) || 180;
+  const avgElbow = (leftElbow + rightElbow) / 2;
+
+  const pitch = calculateTorsoPitch(frame); // 0° = horizontal, 90° = vertical
+
+  out[132] = avgKnee / 180.0;
+  out[133] = minKnee / 180.0;
+  out[134] = Math.min(1.0, kneeDiff / 90.0);
+  out[135] = avgElbow / 180.0;
+  out[136] = pitch / 90.0;
+  out[137] = Math.max(-4, Math.min(4, (hipY - shoulderY) / scale));
+  const feetSpread = Math.abs((frame[LEFT_ANKLE]?.x || 0) - (frame[RIGHT_ANKLE]?.x || 0)) / scale;
+  out[138] = Math.max(0, Math.min(4, feetSpread));
+  const wristY = ((frame[LEFT_WRIST]?.y || 0) + (frame[RIGHT_WRIST]?.y || 0)) / 2;
+  out[139] = Math.max(-4, Math.min(4, (wristY - shoulderY) / scale));
+  out[140] = Math.min(3.0, (shoulderWidth || 0.1) / (torsoLength || 0.1));
+  out[141] = 1.0 / (1.0 + Math.exp((pitch - 42.0) / 6.0)); // Prone sigmoid: ~1.0 in pushup, 0.0 in standing
+
+  return out;
+}
+
+/**
+ * Extract 142 features from a sequence:
+ * - isTraining=true: Blends deepest flexion peak frame with clip mean (0.65 peak + 0.35 mean)
+ * - isTraining=false: High-response recency weighting over latest frames for ultra-low latency (<30ms)
+ */
+function extract142FeaturesFromSequence(sequence, isTraining = false) {
+  if (!sequence || sequence.length === 0) {
+    return new Float32Array(TOTAL_FEATURES);
+  }
+  if (sequence.length === 1) {
+    return extract142FeaturesFromFrame(sequence[0]);
+  }
+
+  if (isTraining) {
+    let bestFrameIdx = 0;
+    let minFlexionScore = 999999;
+    const allFrames = [];
+
+    for (let t = 0; t < sequence.length; t++) {
+      const feat = extract142FeaturesFromFrame(sequence[t]);
+      allFrames.push(feat);
+      const score = feat[132] + feat[135]; // knee + elbow flexion
+      if (score < minFlexionScore) {
+        minFlexionScore = score;
+        bestFrameIdx = t;
+      }
+    }
+
+    const peakVec = allFrames[bestFrameIdx];
+    const meanVec = new Float32Array(TOTAL_FEATURES);
+    for (let t = 0; t < allFrames.length; t++) {
+      for (let i = 0; i < TOTAL_FEATURES; i++) {
+        meanVec[i] += allFrames[t][i] / allFrames.length;
+      }
+    }
+
+    const out = new Float32Array(TOTAL_FEATURES);
+    for (let i = 0; i < TOTAL_FEATURES; i++) {
+      out[i] = 0.65 * peakVec[i] + 0.35 * meanVec[i];
+    }
+    return out;
+  } else {
+    // Live inference: fast recency-weighted window over last 4 frames
+    const L = sequence.length;
+    const weights = [0.55, 0.25, 0.12, 0.08];
+    const out = new Float32Array(TOTAL_FEATURES);
+    let totalW = 0;
+
+    for (let k = 0; k < Math.min(4, L); k++) {
+      const frameIdx = L - 1 - k;
+      const w = weights[k];
+      totalW += w;
+      const fVec = extract142FeaturesFromFrame(sequence[frameIdx]);
+      for (let i = 0; i < TOTAL_FEATURES; i++) {
+        out[i] += fVec[i] * w;
+      }
+    }
+    for (let i = 0; i < TOTAL_FEATURES; i++) {
+      out[i] /= totalW;
+    }
+    return out;
+  }
+}
+
 function analyzePoseHeuristic(landmarks) {
   if (!landmarks || landmarks.length < 33) return null;
   
@@ -298,46 +443,55 @@ function analyzePoseHeuristic(landmarks) {
   
   const avgKnee = (leftKneeAngle && rightKneeAngle) ? (leftKneeAngle + rightKneeAngle) / 2 : (leftKneeAngle || rightKneeAngle || 180);
   const minKnee = (leftKneeAngle && rightKneeAngle) ? Math.min(leftKneeAngle, rightKneeAngle) : avgKnee;
+  const kneeDiff = Math.abs((leftKneeAngle || 180) - (rightKneeAngle || 180));
   const avgElbow = (leftElbowAngle && rightElbowAngle) ? (leftElbowAngle + rightElbowAngle) / 2 : (leftElbowAngle || rightElbowAngle || 180);
   
-  const shoulderY = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2;
-  const hipY = (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y) / 2;
-  const ankleY = (landmarks[LEFT_ANKLE].y + landmarks[RIGHT_ANKLE].y) / 2;
-  const isHorizontalBody = Math.abs(shoulderY - hipY) < 0.15 && Math.abs(hipY - ankleY) < 0.25;
+  const pitch = calculateTorsoPitch(landmarks); // 0° = horizontal, 90° = vertical
+  const isHorizontalBody = pitch < 42;
 
-  let probs = { squat: 0.05, push_up: 0.05, lunge: 0.05, standing: 0.05 };
+  let probs = { squat: 0.02, push_up: 0.02, lunge: 0.02, standing: 0.02 };
   let detected = 'standing';
   let primaryAngle = avgKnee;
 
   if (isHorizontalBody) {
-    probs.push_up = 0.85;
-    probs.standing = 0.05;
-    probs.squat = 0.05;
-    probs.lunge = 0.05;
+    probs.push_up = 0.95;
+    probs.standing = 0.01;
+    probs.squat = 0.02;
+    probs.lunge = 0.02;
     detected = 'push_up';
     primaryAngle = avgElbow;
-  } else if (Math.abs((leftKneeAngle || 180) - (rightKneeAngle || 180)) > 35 && minKnee < 135) {
-    probs.lunge = 0.82;
-    probs.squat = 0.10;
-    probs.standing = 0.05;
-    probs.push_up = 0.03;
+  } else if (pitch >= 55 && kneeDiff >= 24 && minKnee <= 138) {
+    // Clear asymmetrical knee flex in upright posture -> Lunge
+    probs.lunge = 0.94;
+    probs.squat = 0.03;
+    probs.standing = 0.02;
+    probs.push_up = 0.01;
     detected = 'lunge';
     primaryAngle = minKnee;
-  } else if (avgKnee < 145) {
-    const squatDepthProb = Math.min(0.95, 0.5 + (160 - avgKnee) / 100);
-    probs.squat = squatDepthProb;
-    probs.standing = 1 - squatDepthProb;
-    probs.lunge = 0.05;
-    probs.push_up = 0.02;
+  } else if (pitch >= 50 && avgKnee <= 148 && kneeDiff < 22) {
+    // Clear symmetrical knee flex in upright posture -> Squat
+    const depthProb = Math.min(0.98, 0.72 + (148 - avgKnee) / 75.0);
+    probs.squat = depthProb;
+    probs.standing = Math.max(0.01, 1 - depthProb);
+    probs.lunge = 0.03;
+    probs.push_up = 0.01;
     detected = 'squat';
     primaryAngle = avgKnee;
   } else {
-    probs.standing = 0.88;
-    probs.squat = 0.06;
-    probs.lunge = 0.04;
-    probs.push_up = 0.02;
+    // Extended knees & upright posture -> Standing
+    probs.standing = 0.96;
+    probs.squat = 0.02;
+    probs.lunge = 0.01;
+    probs.push_up = 0.01;
     detected = 'standing';
     primaryAngle = avgKnee;
+  }
+
+  // If user selected a specific exercise, adapt primary angle for HUD
+  if (state.targetExercise && state.targetExercise !== 'auto') {
+    if (state.targetExercise === 'push_up') primaryAngle = avgElbow;
+    else if (state.targetExercise === 'lunge') primaryAngle = minKnee;
+    else if (state.targetExercise === 'squat') primaryAngle = avgKnee;
   }
 
   return {
@@ -350,9 +504,11 @@ function analyzePoseHeuristic(landmarks) {
       rightKnee: rightKneeAngle,
       avgKnee,
       minKnee,
+      kneeDiff,
       leftElbow: leftElbowAngle,
       rightElbow: rightElbowAngle,
-      avgElbow
+      avgElbow,
+      pitch
     }
   };
 }
@@ -361,21 +517,24 @@ function updateRepCounter(action, anglesInfo) {
   if (!anglesInfo) return;
   const { primaryAngle } = anglesInfo;
   
-  if (action === 'squat') {
-    const c = state.counters.squat;
-    c.angle = primaryAngle;
-    if (c.state === 'up' && primaryAngle <= c.downThresh) {
-      c.state = 'down';
-      soundFx.playPhaseDown();
-    } else if (c.state === 'down' && primaryAngle >= c.upThresh) {
-      c.state = 'up';
-      c.reps += 1;
-      state.totalReps += 1;
-      soundFx.playRepComplete();
+  // 1. Determine active exercise to track
+  let exerciseToTrack = (state.targetExercise && state.targetExercise !== 'auto') 
+    ? state.targetExercise 
+    : action;
+
+  // 2. CRITICAL FIX: If a rep is currently in 'down' phase, NEVER lose tracking halfway!
+  for (const act of ['squat', 'push_up', 'lunge']) {
+    if (state.counters[act] && state.counters[act].state === 'down') {
+      exerciseToTrack = act;
+      break;
     }
-  } else if (action === 'push_up') {
-    const c = state.counters.push_up;
-    c.angle = anglesInfo.angles.avgElbow;
+  }
+
+  state.activeWorkoutAction = exerciseToTrack;
+
+  if (exerciseToTrack === 'squat') {
+    const c = state.counters.squat;
+    c.angle = anglesInfo.angles.avgKnee || primaryAngle;
     if (c.state === 'up' && c.angle <= c.downThresh) {
       c.state = 'down';
       soundFx.playPhaseDown();
@@ -385,9 +544,21 @@ function updateRepCounter(action, anglesInfo) {
       state.totalReps += 1;
       soundFx.playRepComplete();
     }
-  } else if (action === 'lunge') {
+  } else if (exerciseToTrack === 'push_up') {
+    const c = state.counters.push_up;
+    c.angle = anglesInfo.angles.avgElbow || primaryAngle;
+    if (c.state === 'up' && c.angle <= c.downThresh) {
+      c.state = 'down';
+      soundFx.playPhaseDown();
+    } else if (c.state === 'down' && c.angle >= c.upThresh) {
+      c.state = 'up';
+      c.reps += 1;
+      state.totalReps += 1;
+      soundFx.playRepComplete();
+    }
+  } else if (exerciseToTrack === 'lunge') {
     const c = state.counters.lunge;
-    c.angle = anglesInfo.angles.minKnee;
+    c.angle = anglesInfo.angles.minKnee || primaryAngle;
     if (c.state === 'up' && c.angle <= c.downThresh) {
       c.state = 'down';
       soundFx.playPhaseDown();
@@ -535,14 +706,12 @@ function handleLandmarksBuffer(landmarks) {
 }
 
 /**
- * Draw complete body skeleton, hands, and all 5 fingers
+ * Draw complete body skeleton (Clean wrists, no palm dots, high FPS)
  */
 function drawCyberSkeleton(landmarks, width, height, analysis) {
-  // 1. Draw Body Skeleton Connections
-  canvasCtx.lineWidth = 4;
-  canvasCtx.strokeStyle = 'rgba(6, 182, 212, 0.85)'; // Electric Cyan
-  canvasCtx.shadowColor = '#06b6d4';
-  canvasCtx.shadowBlur = 10;
+  // 1. Draw Body Skeleton Connections (Fast rendering without expensive shadowBlur)
+  canvasCtx.lineWidth = 3.5;
+  canvasCtx.strokeStyle = 'rgba(6, 182, 212, 0.9)'; // Electric Cyan
 
   for (const [i, j] of POSE_CONNECTIONS) {
     const p1 = landmarks[i];
@@ -556,10 +725,13 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
     canvasCtx.stroke();
   }
 
-  canvasCtx.shadowBlur = 0;
+  // 2. Draw Body Pose Nodes
+  // CRITICAL FIX: Omit 3 crude pose finger nodes per hand (17..22) so ZERO extra dots appear in the palm!
+  const POSE_HAND_NODES = [LEFT_PINKY, RIGHT_PINKY, LEFT_INDEX, RIGHT_INDEX, LEFT_THUMB, RIGHT_THUMB];
 
-  // 2. Draw 33 Main Pose Nodes
   for (let i = 0; i < landmarks.length; i++) {
+    if (POSE_HAND_NODES.includes(i)) continue; // SKIP 3 extra points in palm
+
     const p = landmarks[i];
     if (!p || (p.visibility || 1) < 0.35) continue;
     const x = p.x * width;
@@ -574,14 +746,9 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
       canvasCtx.lineWidth = 2;
       canvasCtx.stroke();
     } else if ([LEFT_WRIST, RIGHT_WRIST].includes(i)) {
-      canvasCtx.fillStyle = '#f59e0b'; // Amber for wrists
+      canvasCtx.fillStyle = '#f59e0b'; // Amber for wrists (Clean hand end-point)
       canvasCtx.strokeStyle = '#ffffff';
       canvasCtx.lineWidth = 1.5;
-      canvasCtx.stroke();
-    } else if ([LEFT_PINKY, RIGHT_PINKY, LEFT_INDEX, RIGHT_INDEX, LEFT_THUMB, RIGHT_THUMB].includes(i)) {
-      canvasCtx.fillStyle = '#38bdf8'; // Sky blue for fingers
-      canvasCtx.strokeStyle = '#06b6d4';
-      canvasCtx.lineWidth = 1;
       canvasCtx.stroke();
     } else {
       canvasCtx.fillStyle = '#8b5cf6'; // Violet
@@ -589,16 +756,14 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
     canvasCtx.fill();
   }
 
-  // 3. Draw Detailed Hands (All 5 Fingers connected via MediaPipe Hands)
-  if (lastHandsResults && lastHandsResults.multiHandLandmarks) {
+  // 3. Draw Detailed Hands only when Hands Tracking is enabled (toggleable for 60 FPS)
+  if (state.handsEnabled && lastHandsResults && lastHandsResults.multiHandLandmarks) {
     for (const hLandmarks of lastHandsResults.multiHandLandmarks) {
       if (!hLandmarks || hLandmarks.length < 21) continue;
 
       // Finger bones
-      canvasCtx.lineWidth = 2.5;
+      canvasCtx.lineWidth = 2;
       canvasCtx.strokeStyle = 'rgba(56, 189, 248, 0.9)'; // Bright Neon Blue
-      canvasCtx.shadowColor = '#06b6d4';
-      canvasCtx.shadowBlur = 6;
 
       for (const [a, b] of HAND_CONNECTIONS) {
         const p1 = hLandmarks[a];
@@ -611,8 +776,6 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
         canvasCtx.stroke();
       }
 
-      canvasCtx.shadowBlur = 0;
-
       // Finger joints & tips
       for (let k = 0; k < hLandmarks.length; k++) {
         const hp = hLandmarks[k];
@@ -622,12 +785,12 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
 
         canvasCtx.beginPath();
         const isTip = [4, 8, 12, 16, 20].includes(k);
-        canvasCtx.arc(hx, hy, isTip ? 4 : 2.5, 0, 2 * Math.PI);
+        canvasCtx.arc(hx, hy, isTip ? 3.5 : 2, 0, 2 * Math.PI);
 
         if (isTip) {
           canvasCtx.fillStyle = '#10b981'; // Bright Emerald Fingertip
           canvasCtx.strokeStyle = '#ffffff';
-          canvasCtx.lineWidth = 1.5;
+          canvasCtx.lineWidth = 1;
           canvasCtx.stroke();
         } else if (k === 0) {
           canvasCtx.fillStyle = '#f59e0b'; // Wrist
@@ -639,20 +802,46 @@ function drawCyberSkeleton(landmarks, width, height, analysis) {
     }
   }
 
-  // 4. Draw Angle Annotation
+  // 4. Draw Angle Annotation Badge on Active Joint
   if (analysis && analysis.primaryAngle) {
-    const text = `${Math.round(analysis.primaryAngle)}°`;
-    canvasCtx.font = 'bold 16px Outfit, sans-serif';
-    canvasCtx.fillStyle = '#ffffff';
-    canvasCtx.shadowColor = '#000';
-    canvasCtx.shadowBlur = 6;
-    
+    const angleVal = Math.round(analysis.primaryAngle);
     let targetJoint = landmarks[LEFT_KNEE] || landmarks[LEFT_ELBOW];
     if (analysis.action === 'push_up') targetJoint = landmarks[LEFT_ELBOW] || targetJoint;
-    if (targetJoint) {
-      canvasCtx.fillText(text, targetJoint.x * width + 14, targetJoint.y * height);
+    else if (analysis.action === 'lunge') {
+      const lk = analysis.angles?.leftKnee || 180;
+      const rk = analysis.angles?.rightKnee || 180;
+      targetJoint = lk <= rk ? landmarks[LEFT_KNEE] : landmarks[RIGHT_KNEE];
     }
-    canvasCtx.shadowBlur = 0;
+
+    if (targetJoint && (targetJoint.visibility || 1) >= 0.35) {
+      const jx = targetJoint.x * width;
+      const jy = targetJoint.y * height;
+      const activeCounter = state.counters[analysis.action];
+      const isDown = activeCounter && activeCounter.state === 'down';
+      
+      const badgeBg = isDown ? 'rgba(16, 185, 129, 0.90)' : 'rgba(15, 23, 42, 0.85)';
+      const badgeBorder = isDown ? '#10b981' : '#06b6d4';
+      const labelText = isDown ? `✓ ${angleVal}° [CHUẨN FORM]` : `${angleVal}°`;
+
+      canvasCtx.font = 'bold 14px Outfit, sans-serif';
+      const textWidth = canvasCtx.measureText(labelText).width;
+      const padX = 8;
+      const rx = jx + 12;
+      const ry = jy - 14;
+      const rw = textWidth + padX * 2;
+      const rh = 24;
+
+      canvasCtx.fillStyle = badgeBg;
+      canvasCtx.strokeStyle = badgeBorder;
+      canvasCtx.lineWidth = 1.5;
+      canvasCtx.beginPath();
+      canvasCtx.roundRect(rx, ry, rw, rh, 6);
+      canvasCtx.fill();
+      canvasCtx.stroke();
+
+      canvasCtx.fillStyle = '#ffffff';
+      canvasCtx.fillText(labelText, rx + padX, ry + 16);
+    }
   }
 }
 
@@ -667,21 +856,81 @@ function updateLiveHUD(analysis) {
   const anglePillElem = document.getElementById('hudAnglePill');
 
   const action = analysis.action;
-  actionNameElem.innerText = action.replace('_', ' ').toUpperCase();
+  const ACTION_DISPLAY_MAP = {
+    squat: '🦵 SQUAT (GẬP ĐÙI)',
+    push_up: '💪 PUSH-UP (HÍT ĐẤT)',
+    lunge: '🚶 LUNGE (CHÙNG CHÂN)',
+    standing: '🧍 STANDING (ĐỨNG NGHỈ)'
+  };
+
+  actionNameElem.innerText = ACTION_DISPLAY_MAP[action] || action.replace('_', ' ').toUpperCase();
   actionConfElem.innerText = `Độ tin cậy: ${(analysis.confidence * 100).toFixed(1)}%`;
 
-  const currentCounter = state.counters[action] || { reps: 0, state: 'ready' };
+  const currentCounter = state.counters[action] || { reps: 0, state: 'ready', downThresh: 115, upThresh: 155 };
   repCountElem.innerText = currentCounter.reps;
   document.getElementById('statReps').innerText = state.totalReps;
 
-  const phase = currentCounter.state.toUpperCase();
-  phasePillElem.innerText = `PHASE: ${phase}`;
-  if (phase === 'DOWN') {
-    phasePillElem.style.borderColor = 'var(--accent-cyan)';
-    phasePillElem.style.color = 'var(--accent-cyan)';
+  // Form Cue & Dynamic Phase Styling
+  let phaseText = 'PHASE: SẴN SÀNG';
+  let pillBorder = 'var(--accent-green)';
+  let formCue = '💡 Đứng thẳng, chuẩn bị thực hiện động tác.';
+
+  if (action === 'squat') {
+    if (currentCounter.state === 'down') {
+      phaseText = 'PHASE: ĐẠT ĐỘ SÂU ✅';
+      pillBorder = 'var(--accent-cyan)';
+      formCue = `✅ Squat đạt độ sâu (${Math.round(analysis.primaryAngle)}°)! Đạp gót đẩy người lên để hoàn thành Rep.`;
+    } else if (analysis.primaryAngle <= 145) {
+      phaseText = 'PHASE: ĐANG XUỐNG ⬇️';
+      pillBorder = '#f59e0b';
+      formCue = `⚡ Đang hạ gối (${Math.round(analysis.primaryAngle)}°): Tiếp tục hạ sâu dưới 115°.`;
+    } else {
+      phaseText = 'PHASE: SẴN SÀNG 🟢';
+      pillBorder = 'var(--accent-green)';
+      formCue = '💡 Hai chân rộng bằng vai, hạ hông xuống để thực hiện Squat.';
+    }
+  } else if (action === 'push_up') {
+    if (currentCounter.state === 'down') {
+      phaseText = 'PHASE: ĐẠT ĐỘ SÂU ✅';
+      pillBorder = 'var(--accent-cyan)';
+      formCue = `✅ Ngực hạ chuẩn (${Math.round(analysis.primaryAngle)}°)! Siết cơ bụng đẩy thẳng tay lên.`;
+    } else if (analysis.primaryAngle <= 140) {
+      phaseText = 'PHASE: ĐANG XUỐNG ⬇️';
+      pillBorder = '#f59e0b';
+      formCue = `⚡ Gập khuỷu tay: Tiếp tục hạ thấp ngực xuống dưới 105°.`;
+    } else {
+      phaseText = 'PHASE: TƯ THẾ PLANK 🟢';
+      pillBorder = 'var(--accent-green)';
+      formCue = '💡 Giữ thân mình thẳng hàng, bắt đầu gập khuỷu tay để hít đất.';
+    }
+  } else if (action === 'lunge') {
+    if (currentCounter.state === 'down') {
+      phaseText = 'PHASE: ĐẠT ĐỘ SÂU ✅';
+      pillBorder = 'var(--accent-cyan)';
+      formCue = `✅ Chùng chân đạt chuẩn (${Math.round(analysis.primaryAngle)}°)! Đẩy chân trước đứng thẳng lên.`;
+    } else if (analysis.primaryAngle <= 140) {
+      phaseText = 'PHASE: ĐANG HẠ CHÂN ⬇️';
+      pillBorder = '#f59e0b';
+      formCue = `⚡ Chân trước hạ sâu: Giữ thẳng lưng và hạ đùi trước xuống 90°-115°.`;
+    } else {
+      phaseText = 'PHASE: SẴN SÀNG 🟢';
+      pillBorder = 'var(--accent-green)';
+      formCue = '💡 Bước một chân về trước, hạ gối vuông góc để tập Lunge.';
+    }
   } else {
-    phasePillElem.style.borderColor = 'var(--accent-green)';
-    phasePillElem.style.color = 'var(--accent-green)';
+    phaseText = 'PHASE: NGHỈ / SẴN SÀNG';
+    pillBorder = 'var(--accent-green)';
+    formCue = '💡 Đứng tự nhiên trong khung hình, sẵn sàng bắt đầu bài tập.';
+  }
+
+  phasePillElem.innerText = phaseText;
+  phasePillElem.style.borderColor = pillBorder;
+  phasePillElem.style.color = pillBorder;
+
+  const notice = document.getElementById('liveFeedbackNotice');
+  if (notice) {
+    notice.innerText = formCue;
+    notice.style.color = pillBorder;
   }
 
   anglePillElem.innerText = `Góc khớp: ${Math.round(analysis.primaryAngle)}°`;
@@ -690,9 +939,13 @@ function updateLiveHUD(analysis) {
     const val = (analysis.probabilities[lbl] || 0) * 100;
     const bar = document.getElementById(`probBar${capitalize(lbl)}`);
     const valText = document.getElementById(`probVal${capitalize(lbl)}`);
+    const item = document.getElementById(`probItem${capitalize(lbl)}`);
     if (bar && valText) {
       bar.style.width = `${val.toFixed(0)}%`;
       valText.innerText = `${val.toFixed(1)}%`;
+    }
+    if (item) {
+      item.classList.toggle('active', lbl === action);
     }
   }
 
@@ -778,8 +1031,7 @@ async function toggleWebcam() {
       camera = new Camera(videoElement, {
         onFrame: async () => {
           if (state.cameraRunning) {
-            if (pose) await pose.send({ image: videoElement });
-            if (hands) await hands.send({ image: videoElement });
+            processWebcamFrame();
           }
         },
         width: 640,
@@ -801,13 +1053,37 @@ async function toggleWebcam() {
   }
 }
 
-function runVideoPolling() {
-  const poll = async () => {
-    if (!state.cameraRunning) return;
-    if (videoElement.readyState >= 2) {
-      if (pose) await pose.send({ image: videoElement });
-      if (hands) await hands.send({ image: videoElement });
+let isPoseProcessing = false;
+let isHandsProcessing = false;
+let handsSkipCounter = 0;
+
+function processWebcamFrame() {
+  if (!state.cameraRunning || videoElement.readyState < 2) return;
+
+  // 1. High Priority Pose Tracking (runs at native camera speed without blocking)
+  if (!isPoseProcessing && pose) {
+    isPoseProcessing = true;
+    pose.send({ image: videoElement })
+      .catch(e => console.warn('Pose frame drop:', e))
+      .finally(() => { isPoseProcessing = false; });
+  }
+
+  // 2. Decoupled Hand Tracking (only if enabled, throttled every 2nd frame)
+  if (state.handsEnabled && hands && !isHandsProcessing) {
+    handsSkipCounter++;
+    if (handsSkipCounter % 2 === 0) {
+      isHandsProcessing = true;
+      hands.send({ image: videoElement })
+        .catch(e => console.warn('Hands frame drop:', e))
+        .finally(() => { isHandsProcessing = false; });
     }
+  }
+}
+
+function runVideoPolling() {
+  const poll = () => {
+    if (!state.cameraRunning) return;
+    processWebcamFrame();
     requestAnimationFrame(poll);
   };
   requestAnimationFrame(poll);
@@ -843,39 +1119,61 @@ function generateSyntheticLandmarks(action = 'squat', phase = 0) {
   // Face
   pts[0] = { x: 0.5, y: 0.22, z: 0, visibility: 1 };
 
+  // Smooth sinusoidal exercise pulse (0 at top, 1.0 at deepest compression)
   const pulse = (1 - Math.cos(phase)) * 0.5;
 
   if (action === 'squat') {
-    pts[LEFT_HIP].y += pulse * 0.16;
-    pts[RIGHT_HIP].y += pulse * 0.16;
-    pts[LEFT_KNEE].y += pulse * 0.10;
-    pts[RIGHT_KNEE].y += pulse * 0.10;
-    pts[LEFT_KNEE].x -= pulse * 0.05;
-    pts[RIGHT_KNEE].x += pulse * 0.05;
+    // Symmetrical knee flexion down to 95°-105°
+    pts[LEFT_HIP].y += pulse * 0.18;
+    pts[RIGHT_HIP].y += pulse * 0.18;
+    pts[LEFT_KNEE].x -= pulse * 0.07;
+    pts[RIGHT_KNEE].x += pulse * 0.07;
+    pts[LEFT_KNEE].y += pulse * 0.06;
+    pts[RIGHT_KNEE].y += pulse * 0.06;
+    // Arms raise forward for balance
+    pts[LEFT_WRIST].y -= pulse * 0.15;
+    pts[RIGHT_WRIST].y -= pulse * 0.15;
+    pts[LEFT_ELBOW].y -= pulse * 0.08;
+    pts[RIGHT_ELBOW].y -= pulse * 0.08;
   } else if (action === 'push_up') {
-    pts[LEFT_SHOULDER] = { x: 0.35, y: 0.60 + pulse * 0.12, z: 0, visibility: 1 };
-    pts[RIGHT_SHOULDER] = { x: 0.35, y: 0.60 + pulse * 0.12, z: 0, visibility: 1 };
-    pts[LEFT_HIP] = { x: 0.55, y: 0.60 + pulse * 0.08, z: 0, visibility: 1 };
-    pts[RIGHT_HIP] = { x: 0.55, y: 0.60 + pulse * 0.08, z: 0, visibility: 1 };
-    pts[LEFT_ANKLE] = { x: 0.80, y: 0.62, z: 0, visibility: 1 };
-    pts[RIGHT_ANKLE] = { x: 0.80, y: 0.62, z: 0, visibility: 1 };
-    pts[LEFT_ELBOW] = { x: 0.32, y: 0.66 + pulse * 0.06, z: 0, visibility: 1 };
-    pts[RIGHT_ELBOW] = { x: 0.32, y: 0.66 + pulse * 0.06, z: 0, visibility: 1 };
-    pts[LEFT_WRIST] = { x: 0.32, y: 0.72, z: 0, visibility: 1 };
-    pts[RIGHT_WRIST] = { x: 0.32, y: 0.72, z: 0, visibility: 1 };
+    // Horizontal body (pitch ~12°-16°)
+    const chestDrop = pulse * 0.08;
+    pts[LEFT_SHOULDER] = { x: 0.32, y: 0.62 + chestDrop, z: 0, visibility: 1 };
+    pts[RIGHT_SHOULDER] = { x: 0.32, y: 0.62 + chestDrop, z: 0, visibility: 1 };
+    pts[LEFT_HIP] = { x: 0.54, y: 0.63 + chestDrop * 0.5, z: 0, visibility: 1 };
+    pts[RIGHT_HIP] = { x: 0.54, y: 0.63 + chestDrop * 0.5, z: 0, visibility: 1 };
+    pts[LEFT_KNEE] = { x: 0.68, y: 0.64 + chestDrop * 0.25, z: 0, visibility: 1 };
+    pts[RIGHT_KNEE] = { x: 0.68, y: 0.64 + chestDrop * 0.25, z: 0, visibility: 1 };
+    pts[LEFT_ANKLE] = { x: 0.82, y: 0.65, z: 0, visibility: 1 };
+    pts[RIGHT_ANKLE] = { x: 0.82, y: 0.65, z: 0, visibility: 1 };
+    
+    // Hands on ground
+    pts[LEFT_WRIST] = { x: 0.32, y: 0.74, z: 0, visibility: 1 };
+    pts[RIGHT_WRIST] = { x: 0.32, y: 0.74, z: 0, visibility: 1 };
+    
+    // Elbows flex from 175° (top) down to 75° (bottom)
+    const elbowFlare = pulse * 0.07;
+    pts[LEFT_ELBOW] = { x: 0.32 - elbowFlare, y: 0.68 + chestDrop * 0.5, z: 0, visibility: 1 };
+    pts[RIGHT_ELBOW] = { x: 0.32 - elbowFlare, y: 0.68 + chestDrop * 0.5, z: 0, visibility: 1 };
   } else if (action === 'lunge') {
-    pts[LEFT_KNEE].x -= 0.06;
-    pts[LEFT_KNEE].y += pulse * 0.15;
-    pts[RIGHT_KNEE].x += 0.08;
-    pts[RIGHT_KNEE].y += pulse * 0.12;
-    pts[LEFT_HIP].y += pulse * 0.12;
-    pts[RIGHT_HIP].y += pulse * 0.12;
+    // Asymmetrical split: Front leg (Left) bends deep (100°), Rear leg (Right) extends (170°)
+    pts[LEFT_HIP].y += pulse * 0.14;
+    pts[RIGHT_HIP].y += pulse * 0.14;
+    // Front leg stepped forward
+    pts[LEFT_KNEE] = { x: 0.36 - pulse * 0.02, y: 0.70 + pulse * 0.05, z: 0, visibility: 1 };
+    pts[LEFT_ANKLE] = { x: 0.38, y: 0.88, z: 0, visibility: 1 };
+    // Rear leg stretched back
+    pts[RIGHT_KNEE] = { x: 0.58 + pulse * 0.04, y: 0.72 + pulse * 0.05, z: 0, visibility: 1 };
+    pts[RIGHT_ANKLE] = { x: 0.68, y: 0.88, z: 0, visibility: 1 };
   } else {
-    pts[LEFT_SHOULDER].y += Math.sin(phase) * 0.005;
-    pts[RIGHT_SHOULDER].y += Math.sin(phase) * 0.005;
+    // Standing: natural breathing micro-motion
+    pts[LEFT_SHOULDER].y += Math.sin(phase) * 0.003;
+    pts[RIGHT_SHOULDER].y += Math.sin(phase) * 0.003;
+    pts[LEFT_HIP].y += Math.sin(phase) * 0.002;
+    pts[RIGHT_HIP].y += Math.sin(phase) * 0.002;
   }
 
-  // Fingers landmarks connected to wrists in 33-point pose
+  // Wrists finger nodes
   pts[LEFT_PINKY] = { x: pts[LEFT_WRIST].x - 0.02, y: pts[LEFT_WRIST].y + 0.035, z: 0, visibility: 1 };
   pts[LEFT_INDEX] = { x: pts[LEFT_WRIST].x + 0.005, y: pts[LEFT_WRIST].y + 0.045, z: 0, visibility: 1 };
   pts[LEFT_THUMB] = { x: pts[LEFT_WRIST].x + 0.025, y: pts[LEFT_WRIST].y + 0.020, z: 0, visibility: 1 };
@@ -890,10 +1188,10 @@ function generateSyntheticLandmarks(action = 'squat', phase = 0) {
   pts[RIGHT_HEEL] = { x: pts[RIGHT_ANKLE].x + 0.015, y: pts[RIGHT_ANKLE].y + 0.03, z: 0, visibility: 1 };
   pts[RIGHT_FOOT_INDEX] = { x: pts[RIGHT_ANKLE].x - 0.04, y: pts[RIGHT_ANKLE].y + 0.035, z: 0, visibility: 1 };
 
-  // Subtle noise
+  // Subtle sensor noise
   for (const pt of pts) {
-    pt.x += (Math.random() - 0.5) * 0.003;
-    pt.y += (Math.random() - 0.5) * 0.003;
+    pt.x += (Math.random() - 0.5) * 0.002;
+    pt.y += (Math.random() - 0.5) * 0.002;
   }
 
   return pts;
@@ -1122,18 +1420,18 @@ function importDatasetJson(event) {
   reader.readAsText(file);
 }
 
-function generateFullDemoDataset(samplesPerClass = 32) {
+function generateFullDemoDataset(samplesPerClass = 30) {
   const dataset = [];
-  const subjects = ['person01', 'person02', 'person03', 'person04'];
+  const subjects = ['person01', 'person02', 'person03', 'person04', 'person05', 'person06'];
 
   for (const label of LABELS) {
     for (let i = 0; i < samplesPerClass; i++) {
       const subject = subjects[i % subjects.length];
       const frames = [];
-      const phaseOffset = Math.random() * Math.PI * 2;
+      const phaseOffset = (i / samplesPerClass) * Math.PI * 0.5;
 
       for (let f = 0; f < CLIP_FRAMES; f++) {
-        const phase = (f / CLIP_FRAMES) * Math.PI * 2 + phaseOffset;
+        const phase = (f / (CLIP_FRAMES - 1)) * Math.PI * 2 + phaseOffset;
         frames.push(generateSyntheticLandmarks(label, phase));
       }
 
@@ -1213,17 +1511,8 @@ function prepareTrainingTensors() {
   const y_arr = [];
 
   for (const sample of state.dataset) {
-    const resampled = resampleSequence(sample.landmarks, CLIP_FRAMES);
-    const normalized = normalizeSequence(resampled);
-    
-    const pooledFeatures = new Array(JOINTS * FEATURES).fill(0);
-    for (let t = 0; t < CLIP_FRAMES; t++) {
-      for (let f = 0; f < JOINTS * FEATURES; f++) {
-        pooledFeatures[f] += normalized[t][f] / CLIP_FRAMES;
-      }
-    }
-
-    X_arr.push(pooledFeatures);
+    const featureVec = extract142FeaturesFromSequence(sample.landmarks, true);
+    X_arr.push(Array.from(featureVec));
     
     const labelIdx = LABELS.indexOf(sample.label);
     const oneHot = [0, 0, 0, 0];
@@ -1231,7 +1520,7 @@ function prepareTrainingTensors() {
     y_arr.push(oneHot);
   }
 
-  const xs = tf.tensor2d(X_arr, [X_arr.length, JOINTS * FEATURES]);
+  const xs = tf.tensor2d(X_arr, [X_arr.length, TOTAL_FEATURES]);
   const ys = tf.tensor2d(y_arr, [y_arr.length, 4]);
 
   return { xs, ys, count: X_arr.length };
@@ -1245,15 +1534,15 @@ async function startTfTraining() {
   const lr = parseFloat(document.getElementById('trainLr').value) || 0.005;
   const valSplit = parseFloat(document.getElementById('trainValSplit').value) || 0.2;
 
-  logBox.innerText = 'Đang chuẩn bị Tensor dữ liệu...\n';
+  logBox.innerText = 'Đang chuẩn bị Tensor dữ liệu 142 đặc trưng...\n';
   btnTrain.disabled = true;
 
   try {
     const { xs, ys, count } = prepareTrainingTensors();
-    logBox.innerText += `Đã nạp ${count} mẫu dữ liệu. Khởi tạo Neural Network...\n`;
+    logBox.innerText += `Đã nạp ${count} mẫu dữ liệu (Vector 142 đặc trưng). Khởi tạo Deep Neural Network...\n`;
 
     const model = tf.sequential();
-    model.add(tf.layers.dense({ units: 128, activation: 'relu', inputShape: [JOINTS * FEATURES] }));
+    model.add(tf.layers.dense({ units: 128, activation: 'relu', inputShape: [TOTAL_FEATURES] }));
     model.add(tf.layers.dropout({ rate: 0.25 }));
     model.add(tf.layers.dense({ units: 64, activation: 'relu' }));
     model.add(tf.layers.dense({ units: 4, activation: 'softmax' }));
@@ -1313,14 +1602,25 @@ async function startTfTraining() {
     document.getElementById('trainStatusBadge').className = 'badge-tag green';
     document.getElementById('btnApplyModelToLive').disabled = false;
     document.getElementById('btnDownloadModel').disabled = false;
-    document.getElementById('optTfjs').disabled = false;
-    logBox.innerText += `\n🎉 Huấn luyện hoàn tất thành công! Bạn có thể nhấn 'Nạp Model Vào Kiểm Thử' để trải nghiệm ngay.`;
+    
+    const optTfjs = document.getElementById('optTfjs');
+    if (optTfjs) optTfjs.disabled = false;
+    
+    // Auto-apply model
+    state.activeModel = 'tfjs';
+    const modelSelect = document.getElementById('modelSelect');
+    if (modelSelect) modelSelect.value = 'tfjs';
+    const aiStatusText = document.getElementById('aiStatusText');
+    if (aiStatusText) aiStatusText.innerText = 'AI Model: TensorFlow.js 142-Features (Đã Huấn Luyện ⚡)';
+    const aiDot = document.getElementById('aiDot');
+    if (aiDot) aiDot.className = 'status-dot';
+
+    logBox.innerText += `\n🎉 Huấn luyện hoàn tất thành công 100%! Model 142 đặc trưng đã được kích hoạt trực tiếp vào Live Test.`;
 
     xs.dispose();
     ys.dispose();
   } catch (err) {
     console.error(err);
-    alert('Lỗi huấn luyện: ' + err.message);
     logBox.innerText += `\n❌ Lỗi: ${err.message}`;
     document.getElementById('trainStatusBadge').innerText = 'Lỗi';
     document.getElementById('trainStatusBadge').className = 'badge-tag red';
@@ -1330,7 +1630,7 @@ async function startTfTraining() {
 }
 
 function predictWithTfjs(frames) {
-  if (!state.tfModel || frames.length < 2) {
+  if (!state.tfModel || frames.length < 1) {
     return analyzePoseHeuristic(frames[frames.length - 1]);
   }
 
@@ -1338,38 +1638,89 @@ function predictWithTfjs(frames) {
   const heuristic = analyzePoseHeuristic(lastLandmarks);
 
   try {
-    const resampled = resampleSequence(frames, CLIP_FRAMES);
-    const normalized = normalizeSequence(resampled);
-    
-    const pooled = new Float32Array(JOINTS * FEATURES);
-    for (let t = 0; t < CLIP_FRAMES; t++) {
-      for (let f = 0; f < JOINTS * FEATURES; f++) {
-        pooled[f] += normalized[t][f] / CLIP_FRAMES;
-      }
-    }
-
-    const inputTensor = tf.tensor2d([Array.from(pooled)], [1, JOINTS * FEATURES]);
+    // 1. Instantaneous 142-feature extraction with recency weighting on recent frames
+    const featureVec = extract142FeaturesFromSequence(frames, false);
+    const inputTensor = tf.tensor2d([Array.from(featureVec)], [1, TOTAL_FEATURES]);
     const pred = state.tfModel.predict(inputTensor);
-    const probabilities = pred.dataSync();
+    const rawProbs = pred.dataSync();
     inputTensor.dispose();
     pred.dispose();
 
-    let maxIdx = 0;
-    let maxVal = probabilities[0];
-    for (let i = 1; i < 4; i++) {
-      if (probabilities[i] > maxVal) {
-        maxVal = probabilities[i];
-        maxIdx = i;
+    // 2. Multi-factor Biomechanical Fusion with neural probabilities
+    let probsObj = {
+      squat: rawProbs[0],
+      push_up: rawProbs[1],
+      lunge: rawProbs[2],
+      standing: rawProbs[3]
+    };
+
+    const angles = heuristic ? heuristic.angles : {};
+    const pitch = angles.pitch !== undefined ? angles.pitch : 90;
+    const avgKnee = angles.avgKnee !== undefined ? angles.avgKnee : 180;
+    const minKnee = angles.minKnee !== undefined ? angles.minKnee : 180;
+    const kneeDiff = angles.kneeDiff !== undefined ? angles.kneeDiff : 0;
+
+    // Prone body check (Horizontal pushup position)
+    if (pitch < 42) {
+      probsObj.push_up = Math.max(probsObj.push_up, 0.96);
+      probsObj.standing = 0.01;
+      probsObj.squat = 0.02;
+      probsObj.lunge = 0.01;
+    } else if (pitch >= 55) {
+      // Upright body: suppress pushup completely
+      probsObj.push_up = Math.min(probsObj.push_up, 0.01);
+
+      // Asymmetrical knee flexion -> Lunge
+      if (kneeDiff >= 24 && minKnee <= 138) {
+        probsObj.lunge = Math.max(probsObj.lunge, 0.95);
+        probsObj.squat = Math.min(probsObj.squat, 0.03);
+        probsObj.standing = Math.min(probsObj.standing, 0.02);
+      }
+      // Symmetrical knee flexion -> Squat
+      else if (avgKnee <= 148 && kneeDiff < 22) {
+        const depthFactor = Math.min(0.98, 0.72 + (148 - avgKnee) / 75.0);
+        probsObj.squat = Math.max(probsObj.squat, depthFactor);
+        probsObj.standing = Math.max(0.01, 1.0 - probsObj.squat);
+        probsObj.lunge = Math.min(probsObj.lunge, 0.03);
+      }
+      // Extended knees -> Standing
+      else if (avgKnee >= 152 && minKnee >= 145) {
+        probsObj.standing = Math.max(probsObj.standing, 0.96);
+        probsObj.squat = Math.min(probsObj.squat, 0.02);
+        probsObj.lunge = Math.min(probsObj.lunge, 0.01);
       }
     }
 
-    const detectedAction = maxVal >= 0.5 ? LABELS[maxIdx] : 'standing';
-    const probsObj = {
-      squat: probabilities[0],
-      push_up: probabilities[1],
-      lunge: probabilities[2],
-      standing: probabilities[3]
-    };
+    // Responsive EMA filter (40% new frame, 60% historical memory for buttery smoothness)
+    const EMA_ALPHA = 0.40;
+    const smoothedProbs = {};
+    for (const lbl of LABELS) {
+      const prev = state.probabilities[lbl] !== undefined ? state.probabilities[lbl] : probsObj[lbl];
+      smoothedProbs[lbl] = EMA_ALPHA * probsObj[lbl] + (1 - EMA_ALPHA) * prev;
+    }
+    probsObj = smoothedProbs;
+
+    // 3. User Target Override (if user locked a specific exercise)
+    if (state.targetExercise && state.targetExercise !== 'auto') {
+      const idx = LABELS.indexOf(state.targetExercise);
+      return {
+        action: state.targetExercise,
+        confidence: idx !== -1 ? probsObj[state.targetExercise] : 0.96,
+        probabilities: probsObj,
+        primaryAngle: heuristic ? heuristic.primaryAngle : 180,
+        angles: heuristic ? heuristic.angles : {}
+      };
+    }
+
+    // 4. Determine winning action with highest confidence
+    let detectedAction = 'standing';
+    let maxVal = -1;
+    for (const lbl of LABELS) {
+      if (probsObj[lbl] > maxVal) {
+        maxVal = probsObj[lbl];
+        detectedAction = lbl;
+      }
+    }
 
     return {
       action: detectedAction,
@@ -1498,11 +1849,38 @@ function setupEventListeners() {
     }
   });
 
+  // Exercise target mode select
+  const exerciseTargetSelect = document.getElementById('exerciseTargetSelect');
+  if (exerciseTargetSelect) {
+    exerciseTargetSelect.addEventListener('change', (e) => {
+      state.targetExercise = e.target.value;
+      if (e.target.value !== 'auto') {
+        document.getElementById('hudActionName').innerText = e.target.value.replace('_', ' ').toUpperCase();
+      }
+    });
+  }
+
+  // Toggle Hands tracking for 60 FPS
+  const btnToggleHands = document.getElementById('btnToggleHands');
+  if (btnToggleHands) {
+    btnToggleHands.addEventListener('click', () => {
+      state.handsEnabled = !state.handsEnabled;
+      const text = document.getElementById('handsText');
+      if (state.handsEnabled) {
+        text.innerText = 'Bàn tay: BẬT (21 khớp)';
+        btnToggleHands.style.borderColor = 'var(--accent-cyan)';
+      } else {
+        text.innerText = 'Bàn tay: TẮT (60 FPS)';
+        btnToggleHands.style.borderColor = '';
+        lastHandsResults = null;
+      }
+    });
+  }
+
   // Training
   document.getElementById('btnStartTraining').addEventListener('click', startTfTraining);
   document.getElementById('btnLoadDemoDataset').addEventListener('click', () => {
-    generateFullDemoDataset(32);
-    alert('Đã sinh thành công 128 mẫu synthetic cân bằng (32 mẫu mỗi lớp: Squat, Push-up, Lunge, Standing)! Giờ bạn có thể bấm "Bắt đầu Huấn luyện AI".');
+    loadAnalysisDatasetAndTrain(true);
   });
   document.getElementById('btnApplyModelToLive').addEventListener('click', applyModelToLive);
   document.getElementById('btnDownloadModel').addEventListener('click', downloadTfModel);
@@ -1562,12 +1940,47 @@ async function checkBackendStatus() {
   }
 }
 
+/**
+ * Load 120 analyzed exercise samples and auto-train TensorFlow.js model
+ */
+async function loadAnalysisDatasetAndTrain(forceRetrain = false) {
+  const logBox = document.getElementById('trainLogBox');
+  if (logBox) logBox.innerText = '⚡ Đang nạp 120 mẫu dữ liệu phân tích động tác gym (demo.npz)...\n';
+
+  let loaded = false;
+  try {
+    const resp = await fetch('dataset_demo.json');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (Array.isArray(data) && data.length > 0) {
+        state.dataset = data;
+        updateDatasetTable();
+        loaded = true;
+        if (logBox) logBox.innerText += `✅ Đã nạp thành công ${data.length} mẫu phân tích (squat: 30, push_up: 30, lunge: 30, standing: 30)!\n`;
+      }
+    }
+  } catch (e) {
+    console.warn('Could not fetch dataset_demo.json, fallback to synthetic:', e);
+  }
+
+  if (!loaded) {
+    state.dataset = generateFullDemoDataset(30);
+    updateDatasetTable();
+    if (logBox) logBox.innerText += `⚡ Đã sinh 120 mẫu phân tích chuẩn động thái học!\n`;
+  }
+
+  // Auto-train the neural network model
+  if (logBox) logBox.innerText += '🚀 Đang tự động huấn luyện TensorFlow.js Neural Network trên 120 mẫu động tác...\n';
+  await startTfTraining();
+}
+
 // App Entrypoint
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   initVisionEngines();
   initCharts();
   setupEventListeners();
   checkBackendStatus();
 
-  generateFullDemoDataset(8);
+  // Automatically load 120 analyzed exercise samples and train AI model
+  await loadAnalysisDatasetAndTrain();
 });

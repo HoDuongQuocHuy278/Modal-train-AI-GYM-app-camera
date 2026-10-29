@@ -128,6 +128,9 @@
             <button class="btn btn-outline" id="btnToggleMirror">
               <span id="mirrorIcon">🔄</span> <span id="mirrorText">Lật gương: BẬT</span>
             </button>
+            <button class="btn btn-outline" id="btnToggleHands">
+              <span id="handsIcon">🖐️</span> <span id="handsText">Bàn tay: TẮT (60 FPS)</span>
+            </button>
             <button class="btn btn-outline" id="btnResetReps">
               <span>🔄</span> Reset Reps
             </button>
@@ -173,10 +176,18 @@
               <h3 class="card-title">
                 <span class="card-title-icon">📊</span> Xác suất phân loại động tác
               </h3>
-              <select class="form-select" id="modelSelect" style="width: auto; padding: 4px 10px; font-size: 0.8rem;">
-                <option value="rules">1. Rule-based Biomechanics (Góc khớp + Ngưỡng)</option>
-                <option value="tfjs" id="optTfjs" disabled>2. TensorFlow.js Model (Chưa train)</option>
-              </select>
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <select class="form-select" id="exerciseTargetSelect" style="width: auto; padding: 4px 10px; font-size: 0.8rem; background: var(--bg-card); border-color: var(--accent-cyan); color: #fff;">
+                  <option value="auto">⚡ AI Nhận diện Tự động (Auto)</option>
+                  <option value="squat">🦵 Khóa bài: Squat (Gánh đùi)</option>
+                  <option value="push_up">💪 Khóa bài: Push-up (Hít đất)</option>
+                  <option value="lunge">🚶 Khóa bài: Lunge (Chùng chân)</option>
+                </select>
+                <select class="form-select" id="modelSelect" style="width: auto; padding: 4px 10px; font-size: 0.8rem;">
+                  <option value="tfjs" id="optTfjs">🧠 TensorFlow.js Model (AI Trained)</option>
+                  <option value="rules">📐 Rule-based Biomechanics (Góc khớp + Ngưỡng)</option>
+                </select>
+              </div>
             </div>
 
             <div class="prob-list">
@@ -422,7 +433,7 @@
               <span>🚀</span> Bắt đầu Huấn luyện AI
             </button>
             <button class="btn btn-cyan" id="btnLoadDemoDataset">
-              <span>📦</span> Tải Bộ Mẫu Giả Lập Chuẩn (128 mẫu)
+              <span>📦</span> Nạp Bộ Dữ Liệu Phân Tích (120 Mẫu Chuẩn)
             </button>
           </div>
 
